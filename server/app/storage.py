@@ -8,6 +8,8 @@ import msgpack
 
 from app.core import pack_message
 
+#------------------------------------------------------------
+
 class Storage:
     def __init__(self, path: str, origin: str) -> None:
         self.path = path

@@ -2,18 +2,19 @@ import logging
 import os
 import signal
 import threading
+import time
 import uuid
 
 import zmq
 
 from app.cluster import BerkeleySync, ElectionManager, Replicator
 from app.core import ServerConfig, ServerState, envelope, pack_message, receive
-from app.network import PeerServer, Publisher, ReferenceClient
+from app.network import PeerClient, PeerServer, Publisher, ReferenceClient
 from app.storage import Storage
 
 LOG = logging.getLogger("server")
 
-# region CLI REQ
+#------------------------------------------------------------
 
 class Handlers:
     def __init__(self, state: ServerState, storage: Storage, publisher: Publisher) -> None:
@@ -122,7 +123,7 @@ class Handlers:
                 response = {
                     "status": "error",
                     "error": "unknown_action",
-                    "action": action
+                    "requested_action": action
                 }
         except (TypeError, ValueError, KeyError) as exc:
             response = {"status": "error", "error": str(exc)}
@@ -138,36 +139,77 @@ class Handlers:
         LOG.info("Action %s | result %s | bot %s", action, response["status"], username)
         return {"request_id": request_id, **response}
 
-# endregion CLI REQ
-
 #------------------------------------------------------------
 
-# region STARTUP
+WORKER_HEARTBEAT_SECONDS = 1.0
+
+def _process(state: ServerState, handlers: Handlers, body: bytes) -> bytes:
+    """Decode one client request, run it and return the packed reply. Never raises."""
+    request_id = None
+    try:
+        request = receive(state.clock, body)
+        request_id = request.get("request_id")
+        LOG.info("REQ received: %s", request)
+        response = handlers.handle(request)
+        action = str(request.get("action", "UNKNOWN"))
+    except Exception as exc:  # noqa: BLE001 - a bad request or a storage error must not kill the worker
+        LOG.warning("Request failed: %s", exc)
+        response = {"status": "error", "error": str(exc)}
+        if request_id is not None:
+            response["request_id"] = request_id
+        action = "ERROR"
+    outgoing = envelope(state.clock, action=action, **response)
+    LOG.info("REP sent: %s", outgoing)
+    return pack_message(outgoing)
 
 def _worker(state: ServerState, context: zmq.Context, handlers: Handlers) -> None:
-    worker = context.socket(zmq.REP)
+    """Worker side of the broker protocol (DEALER <-> ROUTER).
+
+    READY / HEARTBEAT tell the broker this server is alive, so it only routes requests to
+    servers that are up; REPLY answers a REQUEST; DISCONNECT is sent on a clean shutdown.
+    """
+    worker = context.socket(zmq.DEALER)
     worker.setsockopt(zmq.LINGER, 0)
+    worker.setsockopt(zmq.IDENTITY, state.config.name.encode("utf-8"))
+    worker.setsockopt(zmq.IMMEDIATE, 1)  # never queue messages for a broker we are not connected to
     worker.connect(state.config.broker_endpoint)
     poller = zmq.Poller()
     poller.register(worker, zmq.POLLIN)
     LOG.info("Connected to broker: %s", state.config.broker_endpoint)
+
+    def send(frames: list[bytes]) -> bool:
+        try:
+            worker.send_multipart(frames, flags=zmq.NOBLOCK)
+            return True
+        except zmq.Again:
+            return False
+
+    announced = False
+    last_sent = 0.0
     try:
         while not state.stop.is_set():
-            if worker not in dict(poller.poll(400)):
-                continue
-            try:
-                request = receive(state.clock, worker.recv())
-                LOG.info("REQ received: %s", request)
-                response = handlers.handle(request)
-                action = str(request.get("action", "UNKNOWN"))
-            except (ValueError, KeyError, TypeError) as exc:
-                response = {"status": "error", "error": str(exc)}
-                action = "ERROR"
-            outgoing = envelope(state.clock, action=action, **response)
-            worker.send(pack_message(outgoing))
-            LOG.info("REP sent: %s", outgoing)
+            if worker in dict(poller.poll(200)):
+                frames = worker.recv_multipart()
+                if len(frames) == 5 and frames[0] == b"REQUEST" and frames[3] == b"":
+                    _, job_id, client_id, _, body = frames
+                    reply = _process(state, handlers, body)
+                    if send([b"REPLY", job_id, client_id, b"", reply]):
+                        last_sent = time.monotonic()
+                    else:
+                        LOG.warning("Broker unavailable; reply dropped")
+                else:
+                    LOG.warning("Unexpected frames from broker: %s", len(frames))
+            now = time.monotonic()
+            if now - last_sent >= WORKER_HEARTBEAT_SECONDS:
+                # READY announces a new worker; after that, HEARTBEAT. A broker that restarted
+                # registers unknown workers from their next HEARTBEAT.
+                if send([b"HEARTBEAT" if announced else b"READY"]):
+                    announced = True
+                    last_sent = now
     finally:
-        worker.close(linger=0)
+        if announced:
+            send([b"DISCONNECT"])
+        worker.close(linger=500)  # give DISCONNECT a moment to leave
 
 def main() -> None:
     logging.basicConfig(
@@ -177,16 +219,25 @@ def main() -> None:
     config = ServerConfig.from_env()
     state = ServerState(config)
     storage = Storage(config.database_path, config.name)
-    context = zmq.Context()
-    publisher = Publisher(state, context)
+    # One zmq.Context (= one I/O thread) per component. libzmq resolves host names in the
+    # I/O thread, so an unresolvable host (a stopped peer container) must never be able to
+    # freeze the sockets of an unrelated component such as the broker worker.
+    contexts: list[zmq.Context] = []
+
+    def new_context() -> zmq.Context:
+        contexts.append(zmq.Context())
+        return contexts[-1]
+
+    peer_client = PeerClient(state)
+    publisher = Publisher(state, new_context())
     handlers = Handlers(state, storage, publisher)
     components = [
         publisher,
-        PeerServer(state, storage, context),
-        ReferenceClient(state, context),
-        ElectionManager(state, context, publisher),
-        BerkeleySync(state, context),
-        Replicator(state, storage, context),
+        PeerServer(state, storage, new_context()),
+        ReferenceClient(state, new_context()),
+        ElectionManager(state, new_context(), publisher, peer_client),
+        BerkeleySync(state, peer_client),
+        Replicator(state, storage, peer_client),
     ]
 
     def stop(*_args) -> None:
@@ -197,7 +248,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     for component in components:
         component.start()
-    worker = threading.Thread(target=_worker, args=(state, context, handlers), name="client-worker", daemon=True)
+    worker = threading.Thread(target=_worker, args=(state, new_context(), handlers), name="client-worker", daemon=True)
     worker.start()
     LOG.info("Server %s ready; database=%s", config.name, config.database_path)
     try:
@@ -205,15 +256,18 @@ def main() -> None:
             pass
     finally:
         state.stop.set()
-        worker.join(timeout=2)
+        threads = [worker]
         for component in components:
             for attr in ("thread", "subscriber_thread"):
                 thread = getattr(component, attr, None)
                 if thread is not None:
-                    thread.join(timeout=2)
-        context.term()
-
-# endregion STARTUP
+                    threads.append(thread)
+        deadline = time.monotonic() + 4.0  # docker stop waits 10 s before SIGKILL
+        for thread in threads:
+            thread.join(timeout=max(0.1, deadline - time.monotonic()))
+        if not any(thread.is_alive() for thread in threads):
+            for context in contexts:
+                context.term()
 
 #------------------------------------------------------------
 

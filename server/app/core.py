@@ -46,7 +46,6 @@ def unpack_message(payload: bytes) -> dict:
 def envelope(clock: Clock, action: str, **fields: Any) -> dict:
     return {"action": action, **fields, "timestamp": clock.now_ms(), "lamport": clock.tick()}
 
-
 def receive(clock: Clock, payload: bytes) -> dict:
     message = unpack_message(payload)
     clock.observe(int(message["lamport"]))
@@ -86,7 +85,7 @@ class ServerConfig:
             peer_endpoint=os.getenv("PEER_ENDPOINT", f"tcp://{name}:5560"),
             database_path=os.getenv("DATABASE_PATH", "/data/messages.db"),
             heartbeat_every_messages=int(os.getenv("HEARTBEAT_EVERY_MESSAGES", "10")),
-            heartbeat_timeout_seconds=int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "60")),
+            heartbeat_timeout_seconds=int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "15")),
             clock_sync_every_messages=int(os.getenv("CLOCK_SYNC_EVERY_MESSAGES", "15")),
             replication_retry_seconds=int(os.getenv("REPLICATION_RETRY_SECONDS", "3")),
         )
@@ -116,13 +115,20 @@ class ServerState:
             return self.rank, dict(self.peers), self.coordinator
 
     def set_coordinator(self, name, rank):
+        """Record `name` as coordinator if it is listed in the directory with that rank."""
         with self.lock:
             peer = self.peers.get(name)
-            if not peer or peer["rank"] != rank:
-                return False
-            if any(item["rank"] > rank for item in self.peers.values()):
+            if not peer or int(peer["rank"]) != int(rank):
                 return False
             self.coordinator = name
+            return True
+
+    def clear_coordinator(self, name=None):
+        """Forget the coordinator (only if it is `name`, when given). Returns True if cleared."""
+        with self.lock:
+            if self.coordinator is None or (name is not None and self.coordinator != name):
+                return False
+            self.coordinator = None
             return True
 
     def is_coordinator(self):
